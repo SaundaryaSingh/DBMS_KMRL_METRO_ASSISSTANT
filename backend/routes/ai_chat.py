@@ -39,14 +39,20 @@ def ai_chat(request: ChatRequest, db = Depends(get_db)):
                 "system_prompt": "You are a SQL expert.",
                 "input": prompt
             },
-            timeout=20
+            timeout=120
         )
         if response.status_code != 200:
             return {"response": f"Failed to connect to LM Studio AI model. Ensure it is running on localhost:1234. Detail: {response.text}"}
             
         data = response.json()
-        # LM Studio /api/v1/chat usually returns the text directly, or in a content/response/message field
-        sql_query = data.get('content', data.get('response', data.get('message', str(data))))
+        
+        # Handle the specific structure seen in the user error: {'output': [{'content': '...'}]}
+        if 'output' in data and isinstance(data['output'], list) and len(data['output']) > 0:
+            sql_query = data['output'][0].get('content', str(data))
+        else:
+            # Fallback to other common fields
+            sql_query = data.get('content', data.get('response', data.get('message', str(data))))
+            
         if isinstance(sql_query, dict) and 'content' in sql_query:
              sql_query = sql_query['content']
         sql_query = str(sql_query).strip()
@@ -91,10 +97,16 @@ def ai_chat(request: ChatRequest, db = Depends(get_db)):
                 "system_prompt": "You are a helpful Metro Information AI assistant.",
                 "input": summary_prompt
             },
-            timeout=20
+            timeout=120
         )
         data = summary_response.json()
-        final_answer = data.get('content', data.get('response', data.get('message', str(data))))
+        
+        # Handle the specific structure: {'output': [{'content': '...'}]}
+        if 'output' in data and isinstance(data['output'], list) and len(data['output']) > 0:
+            final_answer = data['output'][0].get('content', str(data))
+        else:
+            final_answer = data.get('content', data.get('response', data.get('message', str(data))))
+            
         if isinstance(final_answer, dict) and 'content' in final_answer:
              final_answer = final_answer['content']
         final_answer = str(final_answer).strip()
