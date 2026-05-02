@@ -96,13 +96,16 @@ def run_transaction_2(db = Depends(get_db)):
     logs = []
     
     try:
+        # Clean up first so we can run this multiple times
+        cursor.execute("DELETE FROM Ticket_2NF WHERE ticket_id >= 4")
+        
         cursor.execute("UPDATE Ticket_2NF SET fare = 30 WHERE ticket_id = 1")
         logs.append("Updated Ticket 1 fare to 30")
         
         cursor.execute("SAVEPOINT A")
         logs.append("Created SAVEPOINT A")
         
-        cursor.execute("INSERT INTO Ticket_2NF VALUES (4, 1, 'TrainC', 'RouteX', 40)")
+        cursor.execute("REPLACE INTO Ticket_2NF VALUES (4, 1, 'TrainC', 'RouteX', 40)")
         logs.append("Inserted Ticket 4")
         
         cursor.execute("SAVEPOINT B")
@@ -110,11 +113,11 @@ def run_transaction_2(db = Depends(get_db)):
         
         try:
             # Intentional wrong insert (assuming fare cannot be negative based on logic, but let's just trigger an error or rollback)
-            # The report does: INSERT INTO Ticket_2NF VALUES (5,1,'Invalid',NULL,-10);
-            cursor.execute("INSERT INTO Ticket_2NF VALUES (5, 1, 'Invalid', NULL, -10)")
-            logs.append("Inserted Ticket 5 with negative fare")
+            # We force an error here by trying to insert a duplicate primary key (Ticket 1) instead of negative fare, because negative fare doesn't trigger DB error.
+            cursor.execute("INSERT INTO Ticket_2NF VALUES (1, 1, 'Invalid', NULL, -10)")
+            logs.append("Inserted Ticket 1 again (this should not happen)")
         except Exception as e:
-            logs.append(f"Error on Ticket 5 insert: {str(e)}")
+            logs.append(f"Error on invalid insert: {str(e)}")
             
         cursor.execute("ROLLBACK TO B")
         logs.append("Rolled back to SAVEPOINT B")

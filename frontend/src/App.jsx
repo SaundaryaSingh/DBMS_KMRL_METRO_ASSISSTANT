@@ -1,20 +1,25 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
-import { LayoutDashboard, Database, MessageSquare, ArrowRightLeft, TrainFront } from 'lucide-react';
+import { LayoutDashboard, Database, MessageSquare, ArrowRightLeft, TrainFront, Moon, Sun } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import QueryShowcase from './components/QueryShowcase';
 import AIChat from './components/AIChat';
 import TransactionDemo from './components/TransactionDemo';
 import './index.css';
 
-function Sidebar() {
+function Sidebar({ isLightMode, toggleTheme }) {
   return (
     <div className="sidebar">
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '2rem' }}>
-        <div style={{ background: 'var(--accent-primary)', padding: '0.5rem', borderRadius: '10px', display: 'flex' }}>
-          <TrainFront color="white" size={24} />
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div style={{ background: 'var(--accent-primary)', padding: '0.5rem', borderRadius: '10px', display: 'flex' }}>
+            <TrainFront color="white" size={24} />
+          </div>
+          <h2 style={{ margin: 0, fontSize: '1.4rem', background: 'none', WebkitTextFillColor: 'initial', WebkitBackgroundClip: 'initial' }}>KMRL Metro</h2>
         </div>
-        <h2 style={{ margin: 0, fontSize: '1.4rem', background: 'none', WebkitTextFillColor: 'initial', WebkitBackgroundClip: 'initial' }}>KMRL Metro</h2>
+        <button onClick={toggleTheme} className="btn-secondary" style={{ padding: '0.5rem', borderRadius: '8px', cursor: 'pointer', background: 'transparent', border: '1px solid var(--border-color)', color: 'var(--text-primary)' }}>
+          {isLightMode ? <Moon size={20} /> : <Sun size={20} />}
+        </button>
       </div>
 
       <nav style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
@@ -45,10 +50,22 @@ function Sidebar() {
 }
 
 function App() {
+  const [isLightMode, setIsLightMode] = useState(false);
+
+  useEffect(() => {
+    if (isLightMode) {
+      document.body.classList.add('light-mode');
+    } else {
+      document.body.classList.remove('light-mode');
+    }
+  }, [isLightMode]);
+
+  const toggleTheme = () => setIsLightMode(!isLightMode);
+
   return (
     <BrowserRouter>
       <div className="app-container">
-        <Sidebar />
+        <Sidebar isLightMode={isLightMode} toggleTheme={toggleTheme} />
         <main className="main-content">
           <Routes>
             <Route path="/" element={<Dashboard />} />

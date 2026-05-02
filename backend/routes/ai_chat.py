@@ -1,3 +1,5 @@
+import requests
+import re
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from database import get_db
@@ -7,47 +9,95 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     query: str
 
+SCHEMA_CONTEXT = """
+The database is for a Metro Information System with the following tables:
+- Passenger(passenger_id, name, age, gender, phone)
+- Fare(fare_id, source_station_id, destination_station_id, fare_amount)
+- Station(station_id, station_name, location, zone, line_id)
+- Metro_Line(line_id, line_name, total_stations)
+- Ticket(ticket_id, passenger_id, journey_date, fare_id)
+- Train(train_id, train_name, capacity, line_id)
+- Station_Facility(facility_id, station_id, facility_name)
+- Route(route_id, source_station_id, destination_station_id, line_id)
+"""
+
 @router.post("/chat")
 def ai_chat(request: ChatRequest, db = Depends(get_db)):
     """
-    Mock endpoint for RAG-based AI Chat.
-    In a real scenario, this would use LangChain + OpenAI/Gemini to translate the text to SQL,
-    execute it against `db`, and return a natural language response.
+    RAG-based AI Chat using LM Studio local model.
     """
-    user_query = request.query.lower()
+    user_query = request.query
     
-    # Simple keyword-based mock responses
-    if "total passengers" in user_query:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT COUNT(*) AS total FROM Passenger")
-        res = cursor.fetchone()
-        cursor.close()
-        return {"response": f"Based on the database, there are currently {res['total']} registered passengers in the KMRL system."}
+    # Step 1: Get SQL from LM Studio
+    prompt = f"{SCHEMA_CONTEXT}\n\nUser asks: '{user_query}'\nWrite a valid MySQL query to answer this. Return ONLY the SQL query without any explanation or markdown formatting."
+    
+    try:
+        response = requests.post(
+            "http://localhost:1234/api/v1/chat",
+            json={
+                "model": "google/gemma-4-e2b",
+                "system_prompt": "You are a SQL expert.",
+                "input": prompt
+            },
+            timeout=20
+        )
+        if response.status_code != 200:
+            return {"response": f"Failed to connect to LM Studio AI model. Ensure it is running on localhost:1234. Detail: {response.text}"}
+            
+        data = response.json()
+        # LM Studio /api/v1/chat usually returns the text directly, or in a content/response/message field
+        sql_query = data.get('content', data.get('response', data.get('message', str(data))))
+        if isinstance(sql_query, dict) and 'content' in sql_query:
+             sql_query = sql_query['content']
+        sql_query = str(sql_query).strip()
         
-    elif "average fare" in user_query:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT AVG(fare_amount) AS avg_fare FROM Fare")
-        res = cursor.fetchone()
-        cursor.close()
-        return {"response": f"The average fare across all routes is ₹{float(res['avg_fare']):.2f}."}
+        # Robust SQL extraction
+        sql_match = re.search(r"```sql(.*?)```", sql_query, re.DOTALL | re.IGNORECASE)
+        if sql_match:
+            sql_query = sql_match.group(1).strip()
+        else:
+            sql_match = re.search(r"```(.*?)```", sql_query, re.DOTALL)
+            if sql_match:
+                sql_query = sql_match.group(1).strip()
+            else:
+                select_match = re.search(r"(SELECT.*?;)", sql_query, re.DOTALL | re.IGNORECASE)
+                if select_match:
+                    sql_query = select_match.group(1).strip()
+                else:
+                    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
         
-    elif "stations" in user_query and "zone" in user_query:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT zone, COUNT(*) AS count FROM Station GROUP BY zone")
-        res = cursor.fetchall()
-        cursor.close()
-        zones_str = ", ".join([f"Zone {r['zone']} has {r['count']} stations" for r in res])
-        return {"response": f"Here is the breakdown of stations by zone: {zones_str}."}
-        
-    elif "metro lines" in user_query or "lines" in user_query:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT line_name FROM Metro_Line")
-        res = cursor.fetchall()
-        cursor.close()
-        lines_str = ", ".join([r['line_name'] for r in res])
-        return {"response": f"The KMRL currently operates the following lines: {lines_str}."}
+    except Exception as e:
+        return {"response": f"Error communicating with LM Studio: {e}"}
 
-    else:
-        return {
-            "response": "I am a simulated AI assistant for the KMRL Metro System. I can answer questions about total passengers, average fares, stations by zone, and metro lines. For full text-to-SQL functionality, an LLM API key integration is required."
-        }
+    # Step 2: Execute SQL
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute(sql_query)
+        db_results = cursor.fetchall()
+    except Exception as e:
+        cursor.close()
+        return {"response": f"The AI generated an invalid SQL query: {sql_query}\\n\\nError: {e}"}
+    finally:
+        cursor.close()
+        
+    # Step 3: Summarize result using LM Studio
+    summary_prompt = f"The user asked: '{user_query}'.\\nThe database query returned: {db_results}\\nProvide a brief, natural language answer to the user based on these results."
+    
+    try:
+        summary_response = requests.post(
+            "http://localhost:1234/api/v1/chat",
+            json={
+                "model": "google/gemma-4-e2b",
+                "system_prompt": "You are a helpful Metro Information AI assistant.",
+                "input": summary_prompt
+            },
+            timeout=20
+        )
+        data = summary_response.json()
+        final_answer = data.get('content', data.get('response', data.get('message', str(data))))
+        if isinstance(final_answer, dict) and 'content' in final_answer:
+             final_answer = final_answer['content']
+        final_answer = str(final_answer).strip()
+        return {"response": final_answer}
+    except Exception as e:
+        return {"response": f"Here is the raw data (failed to summarize using AI): {db_results}"}

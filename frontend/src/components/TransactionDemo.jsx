@@ -24,11 +24,17 @@ export default function TransactionDemo() {
     try {
       const res = await fetch(`http://localhost:8000/api/transactions/run/${id}`);
       const data = await res.json();
-      setLogs(data.logs);
-      setFinalState(data.final_state);
+      if (!res.ok) {
+        setLogs([`Error executing transaction: ${data.detail || 'Unknown error'}`]);
+        setFinalState(null);
+      } else {
+        setLogs(data.logs || []);
+        setFinalState(data.final_state || null);
+      }
     } catch (err) {
       console.error(err);
-      setLogs(['Error executing transaction']);
+      setLogs(['Error executing transaction (Network/Backend)']);
+      setFinalState(null);
     }
     setLoading(false);
   };
