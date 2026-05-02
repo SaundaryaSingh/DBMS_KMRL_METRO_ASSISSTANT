@@ -1,6 +1,8 @@
 import requests
 import re
+import json
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from database import get_db
 
@@ -10,7 +12,7 @@ class ChatRequest(BaseModel):
     query: str
 
 SCHEMA_CONTEXT = """
-The database is for a Metro Information System with the following tables:
+The database is for a Metro Information System (KMRL) with the following tables:
 - Passenger(passenger_id, name, age, gender, phone)
 - Fare(fare_id, source_station_id, destination_station_id, fare_amount)
 - Station(station_id, station_name, location, zone, line_id)
@@ -21,95 +23,136 @@ The database is for a Metro Information System with the following tables:
 - Route(route_id, source_station_id, destination_station_id, line_id)
 """
 
-@router.post("/chat")
-def ai_chat(request: ChatRequest, db = Depends(get_db)):
+LM_STUDIO_URL = "http://localhost:1234/api/v1/chat"
+MODEL = "google/gemma-4-e2b"
+
+
+def call_lm_studio(system_prompt: str, user_input: str) -> str:
+    """Call LM Studio and return the text content from the output."""
+    response = requests.post(
+        LM_STUDIO_URL,
+        json={
+            "model": MODEL,
+            "system_prompt": system_prompt,
+            "input": user_input,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    data = response.json()
+    # Primary format: {'output': [{'type': 'message', 'content': '...'}]}
+    if "output" in data and isinstance(data["output"], list) and len(data["output"]) > 0:
+        return str(data["output"][0].get("content", "")).strip()
+    # Fallback formats
+    return str(data.get("content", data.get("response", data.get("message", "")))).strip()
+
+
+def extract_sql(raw: str) -> str | None:
     """
-    RAG-based AI Chat using LM Studio local model.
+    Robustly extract a SQL SELECT/CALL statement from the model output.
+    Returns None if no valid SQL is found.
+    """
+    # 1. Try ```sql ... ``` blocks
+    m = re.search(r"```sql\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 2. Try generic ``` ... ``` blocks
+    m = re.search(r"```\s*(SELECT|CALL|INSERT|UPDATE|DELETE)(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+    if m:
+        return (m.group(1) + m.group(2)).strip()
+
+    # 3. Try to find a SELECT/CALL statement — with OR without semicolon
+    m = re.search(
+        r"(SELECT\s+.+?(?:;|$)|CALL\s+\w+\(.*?\)\s*;?)",
+        raw,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        sql = m.group(1).strip()
+        # Strip any trailing non-SQL prose after the last meaningful token
+        # e.g. "SELECT * FROM Passenger\n\nNote: this returns all passengers"
+        sql = re.split(r"\n\s*\n", sql)[0].strip()
+        return sql.rstrip(";").strip() + ";"   # normalise semicolon
+
+    return None
+
+
+@router.post("/chat")
+async def ai_chat(request: ChatRequest, db=Depends(get_db)):
+    """
+    RAG-based AI Chat using LM Studio local model with streaming.
     """
     user_query = request.query
-    
-    # Step 1: Get SQL from LM Studio
-    prompt = f"{SCHEMA_CONTEXT}\n\nUser asks: '{user_query}'\nWrite a valid MySQL query to answer this. Return ONLY the SQL query without any explanation or markdown formatting."
-    
-    try:
-        response = requests.post(
-            "http://localhost:1234/api/v1/chat",
-            json={
-                "model": "google/gemma-4-e2b",
-                "system_prompt": "You are a SQL expert.",
-                "input": prompt
-            },
-            timeout=120
-        )
-        if response.status_code != 200:
-            return {"response": f"Failed to connect to LM Studio AI model. Ensure it is running on localhost:1234. Detail: {response.text}"}
-            
-        data = response.json()
-        
-        # Handle the specific structure seen in the user error: {'output': [{'content': '...'}]}
-        if 'output' in data and isinstance(data['output'], list) and len(data['output']) > 0:
-            sql_query = data['output'][0].get('content', str(data))
-        else:
-            # Fallback to other common fields
-            sql_query = data.get('content', data.get('response', data.get('message', str(data))))
-            
-        if isinstance(sql_query, dict) and 'content' in sql_query:
-             sql_query = sql_query['content']
-        sql_query = str(sql_query).strip()
-        
-        # Robust SQL extraction
-        sql_match = re.search(r"```sql(.*?)```", sql_query, re.DOTALL | re.IGNORECASE)
-        if sql_match:
-            sql_query = sql_match.group(1).strip()
-        else:
-            sql_match = re.search(r"```(.*?)```", sql_query, re.DOTALL)
-            if sql_match:
-                sql_query = sql_match.group(1).strip()
-            else:
-                select_match = re.search(r"(SELECT.*?;)", sql_query, re.DOTALL | re.IGNORECASE)
-                if select_match:
-                    sql_query = select_match.group(1).strip()
-                else:
-                    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-        
-    except Exception as e:
-        return {"response": f"Error communicating with LM Studio: {e}"}
 
-    # Step 2: Execute SQL
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute(sql_query)
-        db_results = cursor.fetchall()
-    except Exception as e:
-        cursor.close()
-        return {"response": f"The AI generated an invalid SQL query: {sql_query}\\n\\nError: {e}"}
-    finally:
-        cursor.close()
-        
-    # Step 3: Summarize result using LM Studio
-    summary_prompt = f"The user asked: '{user_query}'.\\nThe database query returned: {db_results}\\nProvide a brief, natural language answer to the user based on these results."
-    
-    try:
-        summary_response = requests.post(
-            "http://localhost:1234/api/v1/chat",
-            json={
-                "model": "google/gemma-4-e2b",
-                "system_prompt": "You are a helpful Metro Information AI assistant.",
-                "input": summary_prompt
-            },
-            timeout=120
+    def generate():
+        # ── Step 1: Decide if this is a data query or just a greeting ──────────
+        classify_raw = call_lm_studio(
+            system_prompt=(
+                "You are a classifier. Reply with EXACTLY one word: "
+                "'DATA' if the user is asking for information from a database, "
+                "or 'CHAT' if it is a greeting or conversational message."
+            ),
+            user_input=user_query,
         )
-        data = summary_response.json()
-        
-        # Handle the specific structure: {'output': [{'content': '...'}]}
-        if 'output' in data and isinstance(data['output'], list) and len(data['output']) > 0:
-            final_answer = data['output'][0].get('content', str(data))
-        else:
-            final_answer = data.get('content', data.get('response', data.get('message', str(data))))
-            
-        if isinstance(final_answer, dict) and 'content' in final_answer:
-             final_answer = final_answer['content']
-        final_answer = str(final_answer).strip()
-        return {"response": final_answer}
-    except Exception as e:
-        return {"response": f"Here is the raw data (failed to summarize using AI): {db_results}"}
+        intent = "DATA" if "DATA" in classify_raw.upper() else "CHAT"
+
+        if intent == "CHAT":
+            # Just answer conversationally
+            answer = call_lm_studio(
+                system_prompt="You are the KMRL Metro AI Assistant. Greet the user warmly and tell them they can ask questions about passengers, fares, stations, trains, or tickets.",
+                user_input=user_query,
+            )
+            yield f"data: {json.dumps({'text': answer})}\n\n"
+            return
+
+        # ── Step 2: Generate SQL ────────────────────────────────────────────────
+        sql_raw = call_lm_studio(
+            system_prompt=(
+                "You are a MySQL expert for a Metro Information System. "
+                "Output ONLY a single valid MySQL SELECT or CALL statement. "
+                "No explanation, no markdown, no comments. Just raw SQL."
+            ),
+            user_input=(
+                f"Database schema:\n{SCHEMA_CONTEXT}\n\n"
+                f"Write a MySQL query to answer: {user_query}"
+            ),
+        )
+
+        sql_query = extract_sql(sql_raw)
+
+        if not sql_query:
+            yield f"data: {json.dumps({'text': 'I could not generate a valid SQL query for that question. Please try rephrasing.'})}\n\n"
+            return
+
+        # ── Step 3: Execute SQL ─────────────────────────────────────────────────
+        try:
+            cursor = db.cursor(dictionary=True)
+            cursor.execute(sql_query)
+            db_results = cursor.fetchall()
+            cursor.close()
+        except Exception as e:
+            yield f"data: {json.dumps({'text': f'I had trouble querying the database. The SQL was: `{sql_query}`\\n\\nError: {e}'})}\n\n"
+            return
+
+        # ── Step 4: Summarise in natural language ───────────────────────────────
+        summary = call_lm_studio(
+            system_prompt=(
+                "You are the KMRL Metro Assistant. Answer the user's question "
+                "in one or two sentences using only the data provided. "
+                "Be direct, friendly, and do NOT repeat the raw data or any SQL."
+            ),
+            user_input=(
+                f"User asked: '{user_query}'\n"
+                f"Query result: {db_results}\n"
+                "Answer:"
+            ),
+        )
+
+        # Stream the final summary word-by-word so it feels live
+        words = summary.split(" ")
+        for i, word in enumerate(words):
+            chunk = word if i == 0 else " " + word
+            yield f"data: {json.dumps({'text': chunk})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")

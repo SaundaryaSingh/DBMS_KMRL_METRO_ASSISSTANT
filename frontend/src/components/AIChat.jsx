@@ -27,18 +27,54 @@ export default function AIChat() {
     setLoading(true);
 
     try {
-      const res = await fetch('http://localhost:8000/api/ai/chat', {
+      const response = await fetch('http://localhost:8000/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: userQuery })
       });
-      const data = await res.json();
-      setMessages(prev => [...prev, { role: 'ai', text: data.response }]);
+
+      if (!response.ok) throw new Error('Network response was not ok');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      
+      // Add initial empty AI message
+      setMessages(prev => [...prev, { role: 'ai', text: '' }]);
+      setLoading(false);
+
+      let accumulatedText = '';
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.text) {
+                accumulatedText += data.text;
+                // Update the last AI message
+                setMessages(prev => {
+                  const newMessages = [...prev];
+                  newMessages[newMessages.length - 1].text = accumulatedText;
+                  return newMessages;
+                });
+              }
+            } catch (e) {
+              // Ignore partial JSON chunks
+            }
+          }
+        }
+      }
     } catch (err) {
       console.error(err);
       setMessages(prev => [...prev, { role: 'ai', text: 'Sorry, I encountered an error connecting to the backend.' }]);
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
