@@ -40,10 +40,18 @@ def call_lm_studio(system_prompt: str, user_input: str) -> str:
     )
     response.raise_for_status()
     data = response.json()
-    # Primary format: {'output': [{'type': 'message', 'content': '...'}]}
-    if "output" in data and isinstance(data["output"], list) and len(data["output"]) > 0:
-        return str(data["output"][0].get("content", "")).strip()
-    # Fallback formats
+
+    # Primary format: {'output': [{'type': 'reasoning', ...}, {'type': 'message', 'content': '...'}]}
+    # ALWAYS pick the 'message' type item — never the 'reasoning' item.
+    if "output" in data and isinstance(data["output"], list):
+        for item in data["output"]:
+            if item.get("type") == "message":
+                return str(item.get("content", "")).strip()
+        # Fallback: take last item if no 'message' type found
+        if data["output"]:
+            return str(data["output"][-1].get("content", "")).strip()
+
+    # Fallback for other API formats
     return str(data.get("content", data.get("response", data.get("message", "")))).strip()
 
 
